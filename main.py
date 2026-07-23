@@ -11,119 +11,113 @@ logger = logging.getLogger("tiktok-tts")
 
 app = FastAPI()
 
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: list[WebSocket] = []
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+class StreamerSession:
+    """Una sesión = un streamer + todos los usuarios de la app viéndolo."""
+    def __init__(self, username: str):
+        self.username = username
+        self.subscribers: list[WebSocket] = []
+        self.client: TikTokLiveClient | None = None
+        self.task: asyncio.Task | None = None
 
     async def broadcast(self, data: dict):
         dead = []
-        for connection in self.active_connections:
+        for ws in self.subscribers:
             try:
-                await connection.send_text(json.dumps(data))
+                await ws.send_text(json.dumps(data))
             except Exception:
-                dead.append(connection)
+                dead.append(ws)
         for d in dead:
-            self.disconnect(d)
+            if d in self.subscribers:
+                self.subscribers.remove(d)
 
-manager = ConnectionManager()
+    async def start(self):
+        client = TikTokLiveClient(unique_id=self.username)
 
-tiktok_client: TikTokLiveClient | None = None
-tiktok_task: asyncio.Task | None = None
-connection_lock = asyncio.Lock()  # 👈 evita pisar conexiones a medias
+        @client.on(ConnectEvent)
+        async def on_connect(event: ConnectEvent):
+            await self.broadcast({"type": "status", "status": "connected", "user": self.username})
+
+        @client.on(DisconnectEvent)
+        async def on_disconnect(event: DisconnectEvent):
+            await self.broadcast({"type": "status", "status": "disconnected"})
+
+        @client.on(CommentEvent)
+        async def on_comment(event: CommentEvent):
+            await self.broadcast({"type": "comment", "user": event.user.nickname, "comment": event.comment})
+
+        @client.on(GiftEvent)
+        async def on_gift(event: GiftEvent):
+            if not event.gift.streakable or event.repeat_end:
+                await self.broadcast({
+                    "type": "gift", "user": event.user.nickname,
+                    "gift": event.gift.name, "count": event.repeat_count
+                })
+
+        @client.on(LikeEvent)
+        async def on_like(event: LikeEvent):
+            await self.broadcast({"type": "like", "user": event.user.nickname, "count": event.count})
+
+        @client.on(FollowEvent)
+        async def on_follow(event: FollowEvent):
+            await self.broadcast({"type": "follow", "user": event.user.nickname})
+
+        self.client = client
+        try:
+            await client.start()
+        except UserOfflineError:
+            await self.broadcast({"type": "status", "status": "error", "message": "user_offline"})
+        except UserNotFoundError:
+            await self.broadcast({"type": "status", "status": "error", "message": "user_not_found"})
+        except Exception as e:
+            logger.exception(f"Error en sesión de @{self.username}")
+            await self.broadcast({"type": "status", "status": "error", "message": str(e)})
+        finally:
+            sessions.pop(self.username, None)
+
+    def stop(self):
+        if self.client:
+            asyncio.create_task(self.client.disconnect())
+        if self.task:
+            self.task.cancel()
 
 
-async def start_tiktok_client(username: str):
-    global tiktok_client
-    client = TikTokLiveClient(unique_id=username)
-
-    @client.on(ConnectEvent)
-    async def on_connect(event: ConnectEvent):
-        logger.info(f"Conectado al live de @{username}")
-        await manager.broadcast({"type": "status", "status": "connected", "user": username})
-
-    @client.on(DisconnectEvent)
-    async def on_disconnect(event: DisconnectEvent):
-        logger.info("Desconectado del live")
-        await manager.broadcast({"type": "status", "status": "disconnected"})
-
-    @client.on(CommentEvent)
-    async def on_comment(event: CommentEvent):
-        await manager.broadcast({"type": "comment", "user": event.user.nickname, "comment": event.comment})
-
-    @client.on(GiftEvent)
-    async def on_gift(event: GiftEvent):
-        if not event.gift.streakable or event.repeat_end:
-            await manager.broadcast({
-                "type": "gift", "user": event.user.nickname,
-                "gift": event.gift.name, "count": event.repeat_count
-            })
-
-    @client.on(LikeEvent)
-    async def on_like(event: LikeEvent):
-        await manager.broadcast({"type": "like", "user": event.user.nickname, "count": event.count})
-
-    @client.on(FollowEvent)
-    async def on_follow(event: FollowEvent):
-        await manager.broadcast({"type": "follow", "user": event.user.nickname})
-
-    tiktok_client = client
-
-    try:
-        await client.start()
-    except UserOfflineError:
-        logger.warning(f"@{username} no está en vivo ahorita")
-        await manager.broadcast({"type": "status", "status": "error", "message": "user_offline"})
-    except UserNotFoundError:
-        logger.warning(f"@{username} no existe")
-        await manager.broadcast({"type": "status", "status": "error", "message": "user_not_found"})
-    except Exception as e:
-        logger.exception("Error inesperado conectando a TikTok")
-        await manager.broadcast({"type": "status", "status": "error", "message": str(e)})
-    finally:
-        tiktok_client = None
+# username -> StreamerSession
+sessions: dict[str, StreamerSession] = {}
+sessions_lock = asyncio.Lock()
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "TikTok TTS backend corriendo"}
+    return {"status": "ok", "active_streamers": list(sessions.keys())}
 
 
-@app.post("/connect/{username}")
-async def connect_to_tiktok(username: str):
-    global tiktok_task
-    async with connection_lock:
-        if tiktok_task and not tiktok_task.done():
-            return {"error": "Ya hay una conexión activa. Desconéctala primero."}
-        tiktok_task = asyncio.create_task(start_tiktok_client(username))
-    return {"status": "conectando", "user": username}
+@app.websocket("/ws/{username}")
+async def websocket_endpoint(websocket: WebSocket, username: str):
+    username = username.strip().lower()
+    await websocket.accept()
 
+    async with sessions_lock:
+        session = sessions.get(username)
+        if session is None:
+            session = StreamerSession(username)
+            sessions[username] = session
+            session.task = asyncio.create_task(session.start())
+        session.subscribers.append(websocket)
 
-@app.post("/disconnect")
-async def disconnect_from_tiktok():
-    global tiktok_client, tiktok_task
-    async with connection_lock:
-        if tiktok_client:
-            await tiktok_client.disconnect()
-            tiktok_client = None
-        if tiktok_task:
-            tiktok_task.cancel()
-            tiktok_task = None
-    return {"status": "desconectado"}
+    logger.info(f"Usuario conectado viendo @{username} ({len(session.subscribers)} viendo)")
 
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        session.subscribers.remove(websocket)
+        logger.info(f"Usuario se fue de @{username} ({len(session.subscribers)} restantes)")
+
+        # Si ya nadie está viendo a este streamer, cerramos la conexión con TikTok
+        if not session.subscribers:
+            async with sessions_lock:
+                if username in sessions and not sessions[username].subscribers:
+                    sessions[username].stop()
+                    sessions.pop(username, None)
+                    logger.info(f"Cerrada la sesión de @{username}, nadie la está viendo")

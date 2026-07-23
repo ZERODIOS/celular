@@ -1,0 +1,25 @@
+Metadata-Version: 2.4
+Name: betterproto2
+Version: 0.9.1
+Summary: A better Protobuf / gRPC generator & library
+Project-URL: Documentation, https://betterproto.github.io/python-betterproto2/
+Project-URL: Repository, https://github.com/betterproto/python-betterproto2
+Author-email: Adrien Vannson <adrien.vannson@protonmail.com>, "Daniel G. Taylor" <danielgtaylor@gmail.com>
+License-Expression: MIT
+Keywords: gRPC,protobuf
+Requires-Python: <4.0,>=3.10
+Requires-Dist: python-dateutil>=2.9.0.post0
+Requires-Dist: typing-extensions>=4.14.0
+Provides-Extra: all
+Requires-Dist: grpcio>=1.72.1; extra == 'all'
+Requires-Dist: grpclib>=0.4.8; extra == 'all'
+Requires-Dist: protobuf>=5.29.3; extra == 'all'
+Requires-Dist: pydantic>=2.11.5; extra == 'all'
+Provides-Extra: grpcio
+Requires-Dist: grpcio>=1.72.1; extra == 'grpcio'
+Provides-Extra: grpclib
+Requires-Dist: grpclib>=0.4.8; extra == 'grpclib'
+Provides-Extra: protobuf
+Requires-Dist: protobuf>=5.29.3; extra == 'protobuf'
+Provides-Extra: pydantic
+Requires-Dist: pydantic>=2.11.5; extra == 'pydantic'
